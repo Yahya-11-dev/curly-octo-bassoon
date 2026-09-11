@@ -1,4 +1,33 @@
-mkdir -p ~/sub_bot && cd ~/sub_bot && cat > sub_bot.py << 'PYEOF'
+
+```bash
+#!/usr/bin/env bash
+# setup.sh — one-shot bootstrap for sub_bot on GitHub Codespaces
+# Edit the four vars below, then run:  bash setup.sh
+
+# ─────────── EDIT THESE FOUR ───────────
+PROJECT_ID="proj1"                                     # GCP project id (any short name)
+CLIENT_ID="REPLACE_CLIENT_ID"                          # from GCP OAuth client (Desktop app)
+CLIENT_SECRET="REPLACE_CLIENT_SECRET"                  # from GCP OAuth client
+REFRESH_TOKEN="REPLACE_REFRESH_TOKEN"                  # from: python3 sub_bot.py mint ID SECRET
+
+# ─────────── TARGET CHANNEL ────────────
+# Run `./sub_bot.py resolve @ThukunaOnTopfr` first if you don't have the UC id.
+TARGET_CHANNEL="UCxxxxxxxxxxxxxxxxxxxxxx"
+
+# ─────────── OPTIONAL ──────────────────
+PROXIES=""                                             # one per line if multiple, or leave empty
+ACCOUNT_COOLDOWN="900"
+GLOBAL_DELAY="45"
+# ───────────────────────────────────────
+
+set -e
+
+DIR="$HOME/sub_bot"
+mkdir -p "$DIR"
+cd "$DIR"
+
+echo "[*] writing sub_bot.py ..."
+cat > sub_bot.py << 'PYEOF'
 #!/usr/bin/env python3
 # sub_bot.py — single-file YouTube subscriber pool
 from __future__ import annotations
@@ -503,172 +532,4 @@ def cmd_cookies():
             sessions.append(CookieSession(blob))
         except ValueError as e:
             log.warning(f"account {i}: {e}")
-    if not sessions:
-        raise SystemExit("no usable cookie sessions")
-    store = Store(cfg.db_path)
-
-    def key(s):
-        return "ck:" + hashlib.sha1(s.sapisid.encode()).hexdigest()[:24]
-
-    for s in sessions:
-        store.add_token(key(s), "cookies")
-    while not STOP:
-        did_work = False
-        for s in sessions:
-            if STOP:
-                break
-            k = key(s)
-            target = next((ch for ch in cfg.target_channels if not store.already_done(k, ch)), None)
-            if target is None:
-                continue
-            result = s.subscribe(target)
-            if result.status == "subscribed":
-                store.record_sub(k, target, "subscribed")
-                store.mark_used(k)
-                log.info(f"OK   {k} → {target}")
-                did_work = True
-            elif result.status == "already":
-                store.record_sub(k, target, "already")
-                store.mark_used(k)
-                log.info(f"DUP  {k} → {target}")
-                did_work = True
-            elif result.status == "auth":
-                log.info(f"AUTH {k} — cookies expired")
-                store.mark_dead(k)
-            elif result.status == "rate":
-                log.info(f"RATE {k}, backing off")
-                time.sleep(random.uniform(60, 120))
-            else:
-                log.warning(f"ERR  {k} {result.detail[:120]}")
-            time.sleep(cfg.global_delay + random.uniform(0, cfg.global_delay * 0.5))
-        if not did_work:
-            log.info("idle — sleeping 5 min")
-            for _ in range(30):
-                if STOP:
-                    break
-                time.sleep(10)
-
-
-def cmd_status():
-    cfg = load_config()
-    store = Store(cfg.db_path)
-    _ingest_tokens(cfg, store)
-    alive, dead = store.token_count()
-    print(f"alive tokens : {alive}")
-    print(f"dead tokens  : {dead}")
-    print(f"targets      : {len(cfg.target_channels)}")
-    print(f"proxies      : {len(cfg.proxies)}")
-    now = time.time()
-    with store._conn() as c:
-        tokens = c.execute("SELECT refresh_token FROM tokens WHERE dead=0").fetchall()
-        cached = stale = 0
-        for t in tokens:
-            row = c.execute("SELECT expires_at FROM access_tokens WHERE refresh_token=?", (t["refresh_token"],)).fetchone()
-            if row and row["expires_at"] > now + ACCESS_TOKEN_SAFETY:
-                cached += 1
-            else:
-                stale += 1
-        qrows = c.execute("SELECT project_id, used_units, day FROM project_quota").fetchall()
-    print(f"access cached: {cached} fresh, {stale} need refresh")
-    for r in qrows:
-        remaining = max(0, DEFAULT_DAILY_CAP - r["used_units"])
-        print(f"  quota {r['project_id']} ({r['day']}): used {r['used_units']}, remaining {remaining}")
-
-
-def cmd_cookie_status():
-    cfg = load_config(require_projects=False)
-    store = Store(cfg.db_path)
-    with store._conn() as c:
-        rows = c.execute("SELECT refresh_token, dead, last_used FROM tokens WHERE refresh_token LIKE 'ck:%'").fetchall()
-    print(f"cookie accounts: {len(rows)}")
-    for r in rows:
-        state = "dead" if r["dead"] else "alive"
-        when = time.strftime("%H:%M:%S", time.localtime(r["last_used"])) if r["last_used"] else "never"
-        print(f"  {r['refresh_token']}  {state}  last used {when}")
-
-
-def cmd_refresh():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    cfg = load_config()
-    store = Store(cfg.db_path)
-    _ingest_tokens(cfg, store)
-    pbid = {p.project_id: p for p in cfg.projects}
-    cache = TokenCache(store)
-    rows = store.all_alive_tokens()
-    print(f"refreshing {len(rows)} tokens...")
-    n = cache.pre_warm(rows, pbid, ahead=999_999)
-    print(f"refreshed {n} / {len(rows)}")
-
-
-def cmd_resolve():
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s", datefmt="%H:%M:%S")
-    if len(sys.argv) < 3:
-        print("usage: python3 sub_bot.py resolve @Handle")
-        sys.exit(1)
-    handle = sys.argv[2]
-    cfg = load_config()
-    store = Store(cfg.db_path)
-    _ingest_tokens(cfg, store)
-    picked = _first_access(cfg, store)
-    if not picked:
-        raise SystemExit("no usable tokens — mint one first, or check TOKENS env")
-    access, _ = picked
-    ch_id, method = resolve_channel(access, handle)
-    if ch_id:
-        print(ch_id)
-        print(f"method: {method}", file=sys.stderr)
-    else:
-        print(f"could not resolve {handle!r}", file=sys.stderr)
-        sys.exit(2)
-
-
-def cmd_mint():
-    try:
-        from google_auth_oauthlib.flow import InstalledAppFlow
-    except ImportError:
-        raise SystemExit("pip install google-auth-oauthlib")
-    if len(sys.argv) < 4:
-        print("usage: python3 sub_bot.py mint CLIENT_ID CLIENT_SECRET")
-        sys.exit(1)
-    cid, csec = sys.argv[2], sys.argv[3]
-    cfg = {"installed": {"client_id": cid, "client_secret": csec, "auth_uri": "https://accounts.google.com/o/oauth2/auth", "token_uri": TOKEN_URL, "redirect_uris": ["http://localhost"]}}
-    flow = InstalledAppFlow.from_client_config(cfg, ["https://www.googleapis.com/auth/youtube.force-ssl"])
-    creds = flow.run_local_server(port=0, prompt="consent", access_type="offline")
-    print("\n--- refresh token ---")
-    print(creds.refresh_token)
-    print("---------------------\n")
-    print(f"Add to TOKENS env: {creds.refresh_token}:<project_id>")
-
-
-USAGE = """sub_bot.py
-
-  python3 sub_bot.py run              OAuth loop
-  python3 sub_bot.py cookies          cookie loop (InnerTube)
-  python3 sub_bot.py mint ID SECRET   mint a refresh token
-  python3 sub_bot.py resolve @Handle  handle → UC id
-  python3 sub_bot.py refresh          force-refresh tokens
-  python3 sub_bot.py status           OAuth pool stats
-  python3 sub_bot.py cookie-status    cookie pool stats
-"""
-
-
-def main():
-    if len(sys.argv) < 2:
-        print(USAGE)
-        sys.exit(0)
-    cmd = sys.argv[1]
-    fn = {
-        "run": cmd_run, "cookies": cmd_cookies, "mint": cmd_mint,
-        "resolve": cmd_resolve, "refresh": cmd_refresh,
-        "status": cmd_status, "cookie-status": cmd_cookie_status,
-    }.get(cmd)
-    if not fn:
-        print(USAGE)
-        sys.exit(1)
-    fn()
-
-
-if __name__ == "__main__":
-    main()
-PYEOF
-pip install --quiet requests google-auth-oauthlib && python3 sub_bot.py
+    if no
